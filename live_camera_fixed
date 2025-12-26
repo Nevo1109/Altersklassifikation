@@ -1,0 +1,304 @@
+import torch
+import torch.nn as nn
+import cv2
+import numpy as np
+from PIL import Image
+import torchvision.transforms as transforms
+import os
+import time
+
+class LiveCameraPredictorFixed:
+    def __init__(self, model_path="best_age_model.pth"):
+        print("="*60)
+        print(" LIVE KAMERA - ALTERS-KLASSIFIZIERUNG")
+        print("="*60)
+        
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Device: {self.device}")
+        
+        self.img_size = 112
+        self.age_groups = ["0-17", "18-29", "30-44", "45-59", "60+"]
+        self.age_colors = [
+            (0, 255, 0),    # Grün für jung
+            (0, 200, 100),  # Hellgrün
+            (0, 150, 255),  # Orange
+            (0, 100, 255),  # Dunkelorange
+            (0, 0, 255)     # Rot für alt
+        ]
+        
+        # KORREKTE Modellarchitektur (wie im Training!)
+        # Diese muss GENAU wie dein trainiertes Modell sein
+        class CorrectAgeCNN(nn.Module):
+            def __init__(self, num_classes=5):
+                super(CorrectAgeCNN, self).__init__()
+                self.features = nn.Sequential(
+                    nn.Conv2d(3, 32, 3, padding=1),
+                    nn.BatchNorm2d(32),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2),
+                    
+                    nn.Conv2d(32, 64, 3, padding=1),
+                    nn.BatchNorm2d(64),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2),
+                    
+                    nn.Conv2d(64, 128, 3, padding=1),
+                    nn.BatchNorm2d(128),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2),
+                    
+                    nn.Conv2d(128, 256, 3, padding=1),
+                    nn.BatchNorm2d(256),
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool2d((7, 7))  # Wichtig: Adaptive statt MaxPool
+                )
+                
+                self.classifier = nn.Sequential(
+                    nn.Dropout(0.5),
+                    nn.Linear(256 * 7 * 7, 256),  # 256 statt 512!
+                    nn.ReLU(),
+                    nn.Dropout(0.3),
+                    nn.Linear(256, num_classes)   # 256 statt 512!
+                )
+            
+            def forward(self, x):
+                x = self.features(x)
+                x = x.view(x.size(0), -1)
+                x = self.classifier(x)
+                return x
+        
+        # Modell laden
+        self.model = CorrectAgeCNN(num_classes=5).to(self.device)
+        
+        print(f" Modellarchitektur geladen")
+        
+        if os.path.exists(model_path):
+            print(f" Lade trainiertes Modell: {model_path}")
+            try:
+                # Mit weights_only=True für Sicherheit
+                checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+                self.model.load_state_dict(checkpoint)
+                self.model_loaded = True
+                print(" Modell erfolgreich geladen!")
+            except Exception as e:
+                print(f" Fehler beim Laden: {e}")
+                print("  Starte DEMO-Modus ohne Vorhersage")
+                self.model_loaded = False
+        else:
+            print(f" Modell nicht gefunden: {model_path}")
+            print("  Starte DEMO-Modus ohne Vorhersage")
+            self.model_loaded = False
+        
+        self.model.eval()
+        
+        # Gesichtserkennung
+        print("Initialisiere Gesichtserkennung...")
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+        
+        # Kamera
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            print(" Kamera 0 konnte nicht geöffnet werden!")
+            self.cap = cv2.VideoCapture(1)
+        
+        if self.cap.isOpened():
+            print(" Kamera bereit")
+            print(f"\n TASTENBEFEHLE:")
+            print("   SPACE (LEERTASTE) - Bild speichern")
+            print("   ESC - Beenden")
+            print("   S - Statistiken anzeigen/ausblenden")
+            print("   F - Gesichtserkennung ein/aus")
+            print("   C - Statistiken zurücksetzen")
+        else:
+            print(" Keine Kamera gefunden!")
+    
+    def preprocess_face(self, face_image):
+        """Gesicht für das Modell vorbereiten"""
+        face_pil = Image.fromarray(face_image)
+        
+        # Transformation (genau wie beim Training)
+        transform = transforms.Compose([
+            transforms.Resize((self.img_size, self.img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        
+        face_tensor = transform(face_pil).unsqueeze(0).to(self.device)
+        return face_tensor
+    
+    def predict_face(self, face_tensor):
+        """Vorhersage für ein Gesicht"""
+        with torch.no_grad():
+            outputs = self.model(face_tensor)
+            probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
+            predicted_class = outputs.argmax(1).item()
+            confidence = probabilities[predicted_class].item() * 100
+        
+        return predicted_class, confidence, probabilities.cpu().numpy()
+    
+    def draw_prediction(self, frame, face_rect, prediction, confidence, probabilities):
+        """Vorhersage auf Frame zeichnen"""
+        x, y, w, h = face_rect
+        
+        age_group = self.age_groups[prediction]
+        color = self.age_colors[prediction]
+        
+        # Rechteck um Gesicht
+        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+        
+        # Text-Hintergrund
+        text_bg_y = y - 30 if y > 40 else y + h + 10
+        cv2.rectangle(frame, (x, text_bg_y-20), (x+200, text_bg_y+60), (0, 0, 0), -1)
+        
+        # Altersgruppe anzeigen
+        text = f"{age_group} ({confidence:.0f}%)"
+        cv2.putText(frame, text, (x+5, text_bg_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        
+        # Wahrscheinlichkeitsbalken (vereinfacht)
+        bar_start_x = x + 5
+        bar_start_y = text_bg_y + 20
+        
+        # Nur die 3 wahrscheinlichsten anzeigen
+        top_indices = np.argsort(probabilities)[-3:][::-1]
+        
+        for i, idx in enumerate(top_indices):
+            prob = probabilities[idx] * 100
+            bar_length = int(prob * 1.5)  # Skaliert
+            
+            bar_y = bar_start_y + (i * 15)
+            cv2.rectangle(frame, 
+                         (bar_start_x, bar_y),
+                         (bar_start_x + bar_length, bar_y + 8),
+                         self.age_colors[idx], -1)
+            
+            label = f"{self.age_groups[idx]}: {prob:.0f}%"
+            cv2.putText(frame, label, (bar_start_x + bar_length + 5, bar_y + 7),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        return frame
+    
+    def run(self):
+        """Haupt-Loop für Live-Kamera"""
+        if not self.cap.isOpened():
+            print("Kamera nicht verfügbar. Beende...")
+            return
+        
+        print("\n Starte Live-Kamera...")
+        
+        stats_enabled = True
+        face_detection = True
+        frame_count = 0
+        fps = 0
+        last_time = time.time()
+        
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                print(" Frame konnte nicht gelesen werden")
+                break
+            
+            frame_count += 1
+            
+            # Spiegeln
+            frame = cv2.flip(frame, 1)
+            
+            # Gesichter finden
+            if face_detection:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = self.face_cascade.detectMultiScale(
+                    gray, 
+                    scaleFactor=1.1, 
+                    minNeighbors=5, 
+                    minSize=(50, 50)
+                )
+                
+                for (x, y, w, h) in faces:
+                    face_img = frame[y:y+h, x:x+w]
+                    
+                    if face_img.size > 0 and self.model_loaded:
+                        try:
+                            face_tensor = self.preprocess_face(face_img)
+                            prediction, confidence, probabilities = self.predict_face(face_tensor)
+                            frame = self.draw_prediction(
+                                frame, (x, y, w, h), 
+                                prediction, confidence, probabilities
+                            )
+                        except Exception as e:
+                            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
+                    else:
+                        cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 255, 255), 2)
+            
+            # FPS
+            current_time = time.time()
+            if current_time - last_time >= 1.0:
+                fps = frame_count
+                frame_count = 0
+                last_time = current_time
+            
+            # Info anzeigen
+            cv2.putText(frame, f"FPS: {fps}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            mode_text = "LIVE" if self.model_loaded else "DEMO"
+            cv2.putText(frame, f"Modus: {mode_text}", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            # Frame anzeigen
+            cv2.imshow('Live Alters-Klassifizierung', frame)
+            
+            # Tastatureingaben
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == 27:  # ESC
+                print("\n  Beende...")
+                break
+            elif key == 32:  # SPACE
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = f"screenshot_{timestamp}.jpg"
+                cv2.imwrite(filename, frame)
+                print(f" Bild gespeichert: {filename}")
+            elif key == ord('s') or key == ord('S'):
+                stats_enabled = not stats_enabled
+                print(f"Statistiken: {'EIN' if stats_enabled else 'AUS'}")
+            elif key == ord('f') or key == ord('F'):
+                face_detection = not face_detection
+                print(f"Gesichtserkennung: {'EIN' if face_detection else 'AUS'}")
+        
+        # Aufräumen
+        self.cap.release()
+        cv2.destroyAllWindows()
+        print("\n Programm beendet")
+
+def main():
+    # Prüfe OpenCV
+    try:
+        import cv2
+    except ImportError:
+        print(" OpenCV nicht installiert!")
+        print("Installiere mit: pip install opencv-python")
+        return
+    
+    # Prüfe Modell
+    if not os.path.exists("best_age_model.pth"):
+        print(" best_age_model.pth nicht gefunden!")
+        print("Bitte zuerst Training abschließen.")
+        return
+    
+    # Predictor starten
+    predictor = LiveCameraPredictorFixed("best_age_model.pth")
+    
+    # Haupt-Loop
+    try:
+        predictor.run()
+    except KeyboardInterrupt:
+        print("\n⚠  Abbruch durch Benutzer")
+    except Exception as e:
+        print(f" Fehler: {e}")
+    finally:
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
