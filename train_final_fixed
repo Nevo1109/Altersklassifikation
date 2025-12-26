@@ -1,0 +1,328 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision import models
+import cv2
+import numpy as np
+import os
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+import warnings
+warnings.filterwarnings('ignore')
+
+print("="*70)
+print("UTKFACE ALTERSKLASSIFIZIERUNG - TRAINING START")
+print("="*70)
+
+# 1. SYSTEM INFO
+print(f"\n SYSTEMINFORMATIONEN:")
+print(f"   • PyTorch Version: {torch.__version__}")
+print(f"   • GPU: {torch.cuda.get_device_name(0)}")
+print(f"   • VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+# 2. KONFIGURATION FÜR RTX 2050 4GB
+class Config:
+    DATA_DIR = "UTKFace"
+    IMG_SIZE = 112          # Optimal für 4GB VRAM
+    BATCH_SIZE = 16         # Etwas weniger für 4GB
+    EPOCHS = 25
+    LEARNING_RATE = 0.001
+    NUM_CLASSES = 5         # Altersgruppen
+    NUM_WORKERS = 0         # WICHTIG: 0 für Windows!
+    
+    # Altersgruppen
+    AGE_GROUPS = ["0-17", "18-29", "30-44", "45-59", "60+"]
+
+print(f"\n⚡ OPTIMALE EINSTELLUNGEN FÜR RTX 2050:")
+print(f"   • Batch Size: {Config.BATCH_SIZE}")
+print(f"   • Bildgröße: {Config.IMG_SIZE}x{Config.IMG_SIZE}")
+print(f"   • Epochen: {Config.EPOCHS}")
+print(f"   • Workers: {Config.NUM_WORKERS} (Windows kompatibel)")
+
+# 3. DATEN LADEN
+print(f"\n DATEN WIRD GELADEN...")
+
+if not os.path.exists(Config.DATA_DIR):
+    print(f" FEHLER: '{Config.DATA_DIR}' Ordner nicht gefunden!")
+    exit()
+
+# Sammle alle Bildpfade und Alter
+image_paths = []
+ages = []
+
+for filename in os.listdir(Config.DATA_DIR):
+    if filename.lower().endswith('.jpg'):
+        try:
+            age = int(filename.split('_')[0])
+            if 0 <= age <= 116:
+                image_paths.append(os.path.join(Config.DATA_DIR, filename))
+                ages.append(age)
+        except:
+            continue
+
+print(f"    {len(image_paths)} Bilder gefunden")
+
+if len(image_paths) == 0:
+    print(" Keine gültigen Bilder gefunden!")
+    exit()
+
+# 4. DATASET KLASSE
+class UTKFaceDataset(Dataset):
+    def __init__(self, image_paths, ages, transform=None):
+        self.image_paths = image_paths
+        self.ages = ages
+        self.transform = transform or self.default_transform()
+    
+    def default_transform(self):
+        return transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((Config.IMG_SIZE, Config.IMG_SIZE)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        # Bild laden
+        img = cv2.imread(self.image_paths[idx])
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Alter zu Klasse
+        age = self.ages[idx]
+        if age < 18:
+            age_class = 0      # 0-17
+        elif age < 30:
+            age_class = 1      # 18-29
+        elif age < 45:
+            age_class = 2      # 30-44
+        elif age < 60:
+            age_class = 3      # 45-59
+        else:
+            age_class = 4      # 60+
+        
+        # Transformation
+        if self.transform:
+            img = self.transform(img)
+        
+        return img, age_class
+
+# 5. DATEN AUFTEILEN
+print(f"\n DATEN AUFTEILUNG...")
+train_paths, val_paths, train_ages, val_ages = train_test_split(
+    image_paths, ages, test_size=0.2, random_state=42
+)
+
+print(f"   • Training: {len(train_paths)} Bilder")
+print(f"   • Validation: {len(val_paths)} Bilder")
+
+# Datasets
+train_dataset = UTKFaceDataset(train_paths, train_ages)
+val_dataset = UTKFaceDataset(val_paths, val_ages)
+
+# DataLoaders - WICHTIG: num_workers=0 für Windows!
+train_loader = DataLoader(
+    train_dataset, 
+    batch_size=Config.BATCH_SIZE, 
+    shuffle=True,
+    num_workers=0,          # <- HIER ÄNDERN
+    pin_memory=False        # <- AUCH WICHTIG
+)
+
+val_loader = DataLoader(
+    val_dataset, 
+    batch_size=Config.BATCH_SIZE, 
+    shuffle=False,
+    num_workers=0,          # <- HIER ÄNDERN
+    pin_memory=False        # <- AUCH WICHTIG
+)
+
+# 6. MODELL (Einfacheres Modell)
+print(f"\n MODELL WIRD ERSTELLT...")
+device = torch.device('cuda')
+
+class SimpleAgeClassifier(nn.Module):
+    def __init__(self):
+        super(SimpleAgeClassifier, self).__init__()
+        # Einfacheres Modell für bessere Stabilität
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            
+            nn.Conv2d(128, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(256 * 7 * 7, 256),  # 112/2/2/2/2 = 7
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, Config.NUM_CLASSES)
+        )
+    
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
+
+model = SimpleAgeClassifier().to(device)
+print(f"    Einfaches CNN Modell erstellt")
+
+# 7. TRAINING VORBEREITEN
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.5, patience=3
+)
+
+print(f"\n TRAINING STARTET...")
+print("-" * 70)
+
+best_val_acc = 0
+
+# 8. TRAINING LOOP
+for epoch in range(Config.EPOCHS):
+    # Training
+    model.train()
+    train_loss = 0
+    train_correct = 0
+    train_total = 0
+    
+    pbar = tqdm(train_loader, desc=f'Epoche {epoch+1}/{Config.EPOCHS}')
+    for images, labels in pbar:
+        images, labels = images.to(device), labels.to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        
+        train_loss += loss.item()
+        _, predicted = outputs.max(1)
+        train_total += labels.size(0)
+        train_correct += predicted.eq(labels).sum().item()
+        
+        # Live-Update
+        train_acc = 100. * train_correct / train_total
+        pbar.set_postfix({
+            'Loss': f'{loss.item():.3f}',
+            'Acc': f'{train_acc:.1f}%'
+        })
+    
+    # Validation
+    model.eval()
+    val_loss = 0
+    val_correct = 0
+    val_total = 0
+    
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            
+            val_loss += loss.item()
+            _, predicted = outputs.max(1)
+            val_total += labels.size(0)
+            val_correct += predicted.eq(labels).sum().item()
+    
+    # Statistiken
+    train_acc = 100. * train_correct / train_total
+    val_acc = 100. * val_correct / val_total
+    avg_train_loss = train_loss / len(train_loader)
+    avg_val_loss = val_loss / len(val_loader)
+    
+    print(f"Epoche {epoch+1:02d}: "
+          f"Train Loss: {avg_train_loss:.3f}, "
+          f"Train Acc: {train_acc:.1f}% | "
+          f"Val Loss: {avg_val_loss:.3f}, "
+          f"Val Acc: {val_acc:.1f}%")
+    
+    # Bestes Modell speichern
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save(model.state_dict(), 'best_age_model.pth')
+        print(f"   💾 Bestes Modell gespeichert ({val_acc:.1f}%)")
+    
+    scheduler.step(avg_val_loss)
+    
+    # Speicher aufräumen
+    torch.cuda.empty_cache()
+
+# 9. ERGEBNISSE
+print(f"\n" + "="*70)
+print(" TRAINING ABGESCHLOSSEN!")
+print("="*70)
+print(f"\n ERGEBNISSE:")
+print(f"   • Beste Validation Accuracy: {best_val_acc:.1f}%")
+print(f"   • Modell gespeichert als: best_age_model.pth")
+
+print(f"\n ALTERSGRUPPEN:")
+for i, group in enumerate(Config.AGE_GROUPS):
+    print(f"   Klasse {i}: {group} Jahre")
+
+print(f"\n NÄCHSTE SCHRITTE:")
+print("   python evaluate.py    - Modell evaluieren")
+print("   python predict.py     - Vorhersagen testen")
+
+print(f"\n  Geschätzte Trainingszeit: 15-20 Minuten")
+print("="*70)
+
+# Sofort testen
+print(f"\n SOFORTTEST MIT EINEM BILD...")
+if len(val_paths) > 0:
+    from PIL import Image
+    import torchvision.transforms.functional as F
+    
+    test_img_path = val_paths[0]
+    actual_age = val_ages[0]
+    
+    # Bild vorbereiten
+    img = Image.open(test_img_path).convert('RGB')
+    img = img.resize((Config.IMG_SIZE, Config.IMG_SIZE))
+    img_tensor = transforms.ToTensor()(img)
+    img_tensor = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(img_tensor)
+    img_tensor = img_tensor.unsqueeze(0).to(device)
+    
+    # Vorhersage
+    model.eval()
+    with torch.no_grad():
+        output = model(img_tensor)
+        probabilities = torch.nn.functional.softmax(output[0], dim=0)
+        predicted_class = output.argmax(1).item()
+        confidence = probabilities[predicted_class].item() * 100
+    
+    # Tatsächliche Klasse
+    if actual_age < 18: actual_class = 0
+    elif actual_age < 30: actual_class = 1
+    elif actual_age < 45: actual_class = 2
+    elif actual_age < 60: actual_class = 3
+    else: actual_class = 4
+    
+    print(f"   Testbild: {os.path.basename(test_img_path)}")
+    print(f"   Tatsächliches Alter: {actual_age} Jahre")
+    print(f"   Vorhersage: {Config.AGE_GROUPS[predicted_class]} (Confidence: {confidence:.1f}%)")
+    print(f"   {' Richtig' if predicted_class == actual_class else f'❌ Falsch (war: {Config.AGE_GROUPS[actual_class]})'}")
