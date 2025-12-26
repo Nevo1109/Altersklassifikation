@@ -1,0 +1,234 @@
+import torch
+import torch.nn as nn
+import cv2
+import numpy as np
+from PIL import Image
+import torchvision.transforms as transforms
+import os
+
+class AgePredictor:
+    def __init__(self, model_path="best_age_model.pth"):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.img_size = 112
+        self.age_groups = ["0-17 Jahre", "18-29 Jahre", "30-44 Jahre", "45-59 Jahre", "60+ Jahre"]
+        
+        # Modellarchitektur (muss genau wie beim Training sein!)
+        class SimpleAgeCNN(nn.Module):
+            def __init__(self, num_classes=5):
+                super(SimpleAgeCNN, self).__init__()
+                self.features = nn.Sequential(
+                    nn.Conv2d(3, 32, 3, padding=1),
+                    nn.BatchNorm2d(32),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2),
+                    
+                    nn.Conv2d(32, 64, 3, padding=1),
+                    nn.BatchNorm2d(64),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2),
+                    
+                    nn.Conv2d(64, 128, 3, padding=1),
+                    nn.BatchNorm2d(128),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2),
+                    
+                    nn.Conv2d(128, 256, 3, padding=1),
+                    nn.BatchNorm2d(256),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2),
+                )
+                
+                self.classifier = nn.Sequential(
+                    nn.Dropout(0.5),
+                    nn.Linear(256 * 7 * 7, 512),
+                    nn.ReLU(),
+                    nn.Dropout(0.3),
+                    nn.Linear(512, num_classes)
+                )
+            
+            def forward(self, x):
+                x = self.features(x)
+                x = x.view(x.size(0), -1)
+                x = self.classifier(x)
+                return x
+        
+        # Modell laden
+        self.model = SimpleAgeCNN(num_classes=5).to(self.device)
+        
+        if os.path.exists(model_path):
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            print(f" Modell geladen von: {model_path}")
+        else:
+            print(f"  Modell nicht gefunden: {model_path}")
+            print("   Das Training muss erst fertig sein.")
+        
+        self.model.eval()
+        
+        # Transformations (genau wie beim Training)
+        self.transform = transforms.Compose([
+            transforms.Resize((self.img_size, self.img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+    
+    def predict_image(self, image_path):
+        """Vorhersage für ein einzelnes Bild"""
+        try:
+            # Bild laden
+            if isinstance(image_path, str):
+                image = Image.open(image_path).convert('RGB')
+            else:
+                # Falls bereits PIL Image
+                image = image_path.convert('RGB')
+            
+            # Transformieren
+            image_tensor = self.transform(image).unsqueeze(0).to(self.device)
+            
+            # Vorhersage
+            with torch.no_grad():
+                outputs = self.model(image_tensor)
+                probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
+                predicted_class = outputs.argmax(1).item()
+                confidence = probabilities[predicted_class].item() * 100
+            
+            return {
+                'age_group': self.age_groups[predicted_class],
+                'class': predicted_class,
+                'confidence': confidence,
+                'all_probabilities': probabilities.cpu().numpy()
+            }
+        
+        except Exception as e:
+            return {'error': str(e)}
+    
+    def predict_batch(self, image_paths):
+        """Vorhersage für mehrere Bilder"""
+        results = []
+        for path in image_paths:
+            result = self.predict_image(path)
+            result['filename'] = os.path.basename(path)
+            results.append(result)
+        return results
+
+# Einfache Kommandozeilen-Schnittstelle
+if __name__ == "__main__":
+    print("="*60)
+    print("ALTERS-VORHERSAGE TOOL")
+    print("="*60)
+    
+    # Prüfe ob Modell existiert
+    model_file = "best_age_model.pth"
+    
+    if not os.path.exists(model_file):
+        print(f"\n⚠  WARNUNG: {model_file} nicht gefunden!")
+        print("   Das Training läuft noch (2-3 Stunden).")
+        print("   Du kannst trotzdem das Tool testen mit Beispielen.")
+        
+        # Testmodus mit Dummy-Modell
+        test_mode = input("\nIm Testmodus fortfahren? (j/n): ").lower()
+        if test_mode != 'j':
+            exit()
+    
+    # Predictor erstellen
+    predictor = AgePredictor(model_file)
+    
+    print(f"\n Verfügbare Optionen:")
+    print("   1. Einzelnes Bild vorhersagen")
+    print("   2. Mehrere Bilder vorhersagen")
+    print("   3. Test mit UTKFace Beispielen")
+    
+    choice = input("\nAuswahl (1-3): ")
+    
+    if choice == "1":
+        # Einzelnes Bild
+        image_path = input("Pfad zum Bild: ").strip('"')
+        
+        if os.path.exists(image_path):
+            result = predictor.predict_image(image_path)
+            
+            if 'error' in result:
+                print(f" Fehler: {result['error']}")
+            else:
+                print(f"\n VORHERSAGE:")
+                print(f"   Bild: {os.path.basename(image_path)}")
+                print(f"   Altersgruppe: {result['age_group']}")
+                print(f"   Confidence: {result['confidence']:.1f}%")
+                print(f"   Klasse: {result['class']}")
+        else:
+            print(f" Bild nicht gefunden: {image_path}")
+    
+    elif choice == "2":
+        # Mehrere Bilder
+        folder_path = input("Ordner mit Bildern: ").strip('"')
+        
+        if os.path.exists(folder_path):
+            # Alle JPG/PNG Bilder finden
+            image_extensions = ['.jpg', '.jpeg', '.png', '.bmp']
+            image_files = []
+            
+            for file in os.listdir(folder_path):
+                if any(file.lower().endswith(ext) for ext in image_extensions):
+                    image_files.append(os.path.join(folder_path, file))
+            
+            print(f"\n Gefunden: {len(image_files)} Bilder")
+            
+            if len(image_files) > 0:
+                results = predictor.predict_batch(image_files[:10])  # Max 10
+                
+                print("\n ERGEBNISSE:")
+                for i, result in enumerate(results):
+                    if 'error' in result:
+                        print(f"   {i+1}. {result['filename']}: ❌ {result['error']}")
+                    else:
+                        print(f"   {i+1}. {result['filename']}: {result['age_group']} ({result['confidence']:.1f}%)")
+        else:
+            print(f" Ordner nicht gefunden: {folder_path}")
+    
+    elif choice == "3":
+        # Test mit UTKFace Beispielen
+        print("\n TEST MIT UTKFACE BEISPIELEN:")
+        
+        utkface_dir = "UTKFace"
+        if os.path.exists(utkface_dir):
+            # Einige Beispielbilder finden
+            import random
+            all_images = [f for f in os.listdir(utkface_dir) if f.lower().endswith('.jpg')]
+            
+            if len(all_images) > 0:
+                test_images = random.sample(all_images, min(5, len(all_images)))
+                
+                for filename in test_images:
+                    image_path = os.path.join(utkface_dir, filename)
+                    
+                    # Alter aus Dateiname extrahieren
+                    try:
+                        actual_age = int(filename.split('_')[0])
+                        
+                        # Vorhersage
+                        result = predictor.predict_image(image_path)
+                        
+                        if 'error' not in result:
+                            print(f"\n📸 {filename}")
+                            print(f"   Tatsächliches Alter: {actual_age} Jahre")
+                            print(f"   Vorhersage: {result['age_group']}")
+                            print(f"   Confidence: {result['confidence']:.1f}%")
+                            
+                            # Altersgruppe aus tatsächlichem Alter
+                            if actual_age < 18: actual_group = "0-17 Jahre"
+                            elif actual_age < 30: actual_group = "18-29 Jahre"
+                            elif actual_age < 45: actual_group = "30-44 Jahre"
+                            elif actual_age < 60: actual_group = "45-59 Jahre"
+                            else: actual_group = "60+ Jahre"
+                            
+                            print(f"   Tatsächliche Gruppe: {actual_group}")
+                            print(f"   {' RICHTIG' if result['age_group'] == actual_group else ' FALSCH'}")
+                    except:
+                        print(f"  Konnte {filename} nicht verarbeiten")
+            else:
+                print("Keine Bilder in UTKFace Ordner gefunden")
+        else:
+            print(f"UTKFace Ordner nicht gefunden: {utkface_dir}")
+    
+    print(f"\n" + "="*60)
+    print("FERTIG! Das Training läuft weiter im Hintergrund.")
+    print("="*60)
