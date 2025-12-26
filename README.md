@@ -80,15 +80,13 @@ Wähle Option 3 und gib den Pfad zum Ordner an.
 
 ```
 Altersklassifizierung/
-├── UTKFace/                    # Trainingsdaten
-├── venv/                       # Virtuelle Environment
+├── UTKFace/                    # Trainingsdaten herunterzuladen bei kaggle
+├── venv/                       # Virtuelle Environment manuell erstellen
 ├── train_final_fixed.py        # Haupt-Trainingsskript
 ├── analyze_image.py           # Bildanalyse-Tool
 ├── live_camera_fixed.py       # Live-Kamera
 ├── age_predictor.py           # Kommandozeilen-Tool
-├── best_age_model.pth         # Trainiertes Modell
-├── setup.bat                  # Einrichtungsskript
-└── start_camera.bat           # Kamera-Startskript
+
 ```
 
 ## ** Modell-Architektur**
